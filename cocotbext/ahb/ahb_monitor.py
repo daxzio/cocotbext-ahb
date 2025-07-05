@@ -12,7 +12,7 @@ import copy
 import struct
 import datetime
 
-from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp
+from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp, AHBBurst
 from .ahb_bus import AHBBus
 from .version import __version__
 
@@ -33,6 +33,19 @@ class AHBMonitor(Monitor):
         self.rst = reset
         self.bus = bus
 
+        # Burst tracking state
+        self.burst_state = {
+            "active": False,
+            "type": AHBBurst.SINGLE,
+            "size": AHBSize.WORD,
+            "start_addr": 0,
+            "current_addr": 0,
+            "beat_count": 0,
+            "expected_beats": 0,
+            "write_mode": False,
+            "transactions": []
+        }
+
         # We extend from Monitor base class because we don't need to recreate
         # the internal bus property as it already exists from AHBBus
         Monitor.__init__(self, **kwargs)
@@ -43,6 +56,129 @@ class AHBMonitor(Monitor):
             f"Copyright (c) {datetime.datetime.now().year} Anderson Ignacio da Silva"
         )
         self.log.info("https://github.com/aignacio/cocotbext-ahb")
+
+    def _get_burst_length(self, burst_type: AHBBurst) -> int:
+        """Get the expected number of beats for a burst type."""
+        burst_lengths = {
+            AHBBurst.SINGLE: 1,
+            AHBBurst.INCR: 0,  # Undefined length
+            AHBBurst.WRAP4: 4,
+            AHBBurst.INCR4: 4,
+            AHBBurst.WRAP8: 8,
+            AHBBurst.INCR8: 8,
+            AHBBurst.WRAP16: 16,
+            AHBBurst.INCR16: 16,
+        }
+        return burst_lengths.get(burst_type, 1)
+
+    def _get_next_burst_addr(self, current_addr: int, burst_type: AHBBurst, size: AHBSize) -> int:
+        """Calculate the next address in a burst sequence."""
+        byte_size = 2 ** size.value
+        
+        if burst_type == AHBBurst.SINGLE:
+            return current_addr
+        elif burst_type == AHBBurst.INCR or burst_type in [AHBBurst.INCR4, AHBBurst.INCR8, AHBBurst.INCR16]:
+            # Incremental bursts
+            return current_addr + byte_size
+        elif burst_type in [AHBBurst.WRAP4, AHBBurst.WRAP8, AHBBurst.WRAP16]:
+            # Wrapping bursts
+            if burst_type == AHBBurst.WRAP4:
+                wrap_boundary = 4 * byte_size
+            elif burst_type == AHBBurst.WRAP8:
+                wrap_boundary = 8 * byte_size
+            else:  # WRAP16
+                wrap_boundary = 16 * byte_size
+            
+            # Calculate wrapped address
+            aligned_start = (current_addr // wrap_boundary) * wrap_boundary
+            next_addr = current_addr + byte_size
+            if next_addr >= aligned_start + wrap_boundary:
+                next_addr = aligned_start
+            return next_addr
+        
+        return current_addr
+
+    def _validate_burst_address(self, expected_addr: int, actual_addr: int, burst_type: AHBBurst) -> bool:
+        """Validate that the burst address follows the expected pattern."""
+        if burst_type == AHBBurst.INCR:
+            # INCR bursts can have any addressing pattern
+            return True
+        return expected_addr == actual_addr
+
+    def _start_burst(self, txn_data: dict) -> None:
+        """Initialize a new burst sequence."""
+        burst_type = AHBBurst(txn_data.get("hburst", AHBBurst.SINGLE))
+        
+        self.burst_state = {
+            "active": True,
+            "type": burst_type,
+            "size": AHBSize(txn_data["hsize"]),
+            "start_addr": txn_data["haddr"],
+            "current_addr": txn_data["haddr"],
+            "beat_count": 1,
+            "expected_beats": self._get_burst_length(burst_type),
+            "write_mode": bool(txn_data["hwrite"]),
+            "transactions": []
+        }
+
+    def _continue_burst(self, txn_data: dict) -> bool:
+        """Continue an existing burst sequence."""
+        if not self.burst_state["active"]:
+            return False
+        
+        current_addr = txn_data["haddr"]
+        expected_addr = self._get_next_burst_addr(
+            self.burst_state["current_addr"], 
+            self.burst_state["type"], 
+            self.burst_state["size"]
+        )
+        
+        # Validate burst address
+        if not self._validate_burst_address(expected_addr, current_addr, self.burst_state["type"]):
+            raise AssertionError(
+                f"[{self.bus.name}/{self.name}] AHB PROTOCOL VIOLATION: "
+                f"Invalid burst address sequence. Expected: 0x{expected_addr:08X}, "
+                f"Got: 0x{current_addr:08X}, Burst Type: {self.burst_state['type']}"
+            )
+        
+        # Validate consistent burst parameters
+        if (AHBSize(txn_data["hsize"]) != self.burst_state["size"] or
+            bool(txn_data["hwrite"]) != self.burst_state["write_mode"]):
+            raise AssertionError(
+                f"[{self.bus.name}/{self.name}] AHB PROTOCOL VIOLATION: "
+                f"Burst parameters must remain constant throughout the burst"
+            )
+        
+        self.burst_state["current_addr"] = current_addr
+        self.burst_state["beat_count"] += 1
+        
+        # Check if we've exceeded expected beats for defined length bursts
+        if (self.burst_state["expected_beats"] > 0 and 
+            self.burst_state["beat_count"] > self.burst_state["expected_beats"]):
+            raise AssertionError(
+                f"[{self.bus.name}/{self.name}] AHB PROTOCOL VIOLATION: "
+                f"Burst exceeded expected length of {self.burst_state['expected_beats']} beats"
+            )
+        
+        return True
+
+    def _end_burst(self) -> List[dict]:
+        """End the current burst and return all transactions."""
+        if not self.burst_state["active"]:
+            return []
+        
+        transactions = self.burst_state["transactions"].copy()
+        
+        # Validate burst completion for defined length bursts
+        if (self.burst_state["expected_beats"] > 0 and 
+            self.burst_state["beat_count"] != self.burst_state["expected_beats"]):
+            self.log.warning(
+                f"Burst ended early. Expected {self.burst_state['expected_beats']} beats, "
+                f"got {self.burst_state['beat_count']} beats"
+            )
+        
+        self.burst_state["active"] = False
+        return transactions
 
     async def _monitor_recv(self):
         """Watch the pins and reconstruct transactions."""
@@ -104,6 +240,11 @@ class AHBMonitor(Monitor):
                     first_txn["hrdata"] = copy.deepcopy(self.bus.hrdata.value)
                     first_txn["hwdata"] = copy.deepcopy(self.bus.hwdata.value)
 
+                    # Get burst type if available
+                    burst_type = AHBBurst.SINGLE
+                    if self.bus.hburst_exist:
+                        burst_type = AHBBurst(first_txn.get("hburst", AHBBurst.SINGLE))
+
                     txn = AHBTxn(
                         int(first_txn["haddr"]),
                         AHBSize(first_txn["hsize"]),
@@ -111,11 +252,35 @@ class AHBMonitor(Monitor):
                         AHBResp(first_txn["response"]),
                         int(first_txn["hwdata"]),
                         int(first_txn["hrdata"]),
+                        burst_type,
+                        AHBTrans(first_txn["htrans"]),
+                        is_burst_start=first_txn["htrans"] == AHBTrans.NONSEQ,
+                        is_burst_end=not self.burst_state["active"] or first_txn["htrans"] != AHBTrans.SEQ
                     )
 
+                    # Handle burst tracking
+                    if first_txn["htrans"] == AHBTrans.NONSEQ:
+                        # Start of new burst or single transfer
+                        if self.burst_state["active"]:
+                            # End previous burst if it was active
+                            self._end_burst()
+                        
+                        if burst_type != AHBBurst.SINGLE:
+                            self._start_burst(first_txn)
+                    elif first_txn["htrans"] == AHBTrans.SEQ:
+                        # Continuation of burst
+                        if not self._continue_burst(first_txn):
+                            raise AssertionError(
+                                f"[{self.bus.name}/{self.name}] AHB PROTOCOL VIOLATION: "
+                                f"SEQ transfer without active burst"
+                            )
+
+                    # Add transaction to burst if active
+                    if self.burst_state["active"]:
+                        self.burst_state["transactions"].append(txn)
+                    
+                    # Send transaction to monitor
                     self._recv(txn)
-                    # exp_data = int(first_txn["hrdata"]) # struct.pack("I",int(first_txn['hrdata']))
-                    # self._recv(exp_data)
 
                     # Restart the txn status
                     first_st["phase"] = "none"
@@ -136,6 +301,13 @@ class AHBMonitor(Monitor):
                 first_txn["htrans"] = copy.deepcopy(self.bus.htrans.value)
                 first_txn["hsize"] = copy.deepcopy(self.bus.hsize.value)
                 first_txn["hwrite"] = copy.deepcopy(self.bus.hwrite.value)
+                
+                # Capture burst information if available
+                if self.bus.hburst_exist:
+                    first_txn["hburst"] = copy.deepcopy(self.bus.hburst.value)
+                else:
+                    first_txn["hburst"] = AHBBurst.SINGLE
+
             # We only enter in the if below if the last txn did not complete and the master issued a new txn
             elif (self._check_valid_txn() is True) and (first_st["phase"] == "data"):
                 second_st["phase"] = "addr"
@@ -147,6 +319,12 @@ class AHBMonitor(Monitor):
                 second_txn["htrans"] = copy.deepcopy(self.bus.htrans.value)
                 second_txn["hsize"] = copy.deepcopy(self.bus.hsize.value)
                 second_txn["hwrite"] = copy.deepcopy(self.bus.hwrite.value)
+                
+                # Capture burst information if available
+                if self.bus.hburst_exist:
+                    second_txn["hburst"] = copy.deepcopy(self.bus.hburst.value)
+                else:
+                    second_txn["hburst"] = AHBBurst.SINGLE
 
             if first_st["phase"] == "addr":
                 self._check_signals(first_txn)
@@ -250,6 +428,10 @@ class AHBTxn:
         resp: AHBResp = AHBResp.OKAY,
         wdata: int = 0x00,
         rdata: int = 0x00,
+        burst: AHBBurst = AHBBurst.SINGLE,
+        trans: AHBTrans = AHBTrans.NONSEQ,
+        is_burst_start: bool = False,
+        is_burst_end: bool = True,
     ):
         self.addr = addr
         self.size = size
@@ -257,8 +439,17 @@ class AHBTxn:
         self.resp = resp
         self.wdata = wdata
         self.rdata = rdata
+        self.burst = burst
+        self.trans = trans
+        self.is_burst_start = is_burst_start
+        self.is_burst_end = is_burst_end
 
     def __str__(self):
+        burst_info = f"Burst: {self.burst.name}"
+        if self.burst != AHBBurst.SINGLE:
+            burst_info += f" ({'Start' if self.is_burst_start else 'Continue'}"
+            burst_info += f"{' End' if self.is_burst_end else ''})"
+        
         return (
             f"AHB Txn Details:\n"
             f"  Address: 0x{self.addr:08X}\n"
@@ -267,6 +458,8 @@ class AHBTxn:
             f"  Response: {'OKAY' if self.resp == 0 else 'ERROR'} (0x{self.resp:02X})\n"
             f"  Write Data: 0x{self.wdata:08X}\n"
             f"  Read Data: 0x{self.rdata:08X}\n"
+            f"  Transfer: {self.trans.name}\n"
+            f"  {burst_info}\n"
         )
 
     def __eq__(self, other):
@@ -280,5 +473,9 @@ class AHBTxn:
                 and self.resp == other.resp
                 and self.wdata == other.wdata
                 and self.rdata == other.rdata
+                and self.burst == other.burst
+                and self.trans == other.trans
+                and self.is_burst_start == other.is_burst_start
+                and self.is_burst_end == other.is_burst_end
             )
         return False
