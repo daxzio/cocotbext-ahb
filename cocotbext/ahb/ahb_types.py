@@ -16,6 +16,8 @@ class AHBSize(enum.IntEnum):
     DWORD = 0b011
     FWORD = 0b100
     EWORD = 0b101
+    XWORD = 0b110
+    YWORD = 0b111
 
 
 class AHBBurst(enum.IntEnum):
