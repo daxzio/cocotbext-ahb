@@ -188,6 +188,9 @@ class AHBMonitor(Monitor):
             signals["hburst"] = self.bus.hburst
 
         for var, val in signals.items():
+            if val is None:
+                raise AssertionError(f"{var} is not found in bus")
+
             if val.value.is_resolvable is False:
                 # self.log.warn(f"{var} is not resolvable")
                 return False
