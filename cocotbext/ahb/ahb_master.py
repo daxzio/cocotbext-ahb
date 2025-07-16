@@ -4,11 +4,12 @@
 # License           : MIT license <Check LICENSE>
 # Author            : Anderson I. da Silva (aignacio) <anderson@aignacio.com>
 # Date              : 08.10.2023
-# Last Modified Date: 27.12.2024
+# Last Modified Date: 24.10.2024
 import logging
 import cocotb
 import copy
 import datetime
+from random import randint, seed     
 
 from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp, AHBBurst
 from .ahb_bus import AHBBus
@@ -28,6 +29,7 @@ class AHBLiteMaster:
         timeout: int = 100,
         def_val: Union[int, str] = 0,  # Can be set to "Z",
         name: str = "ahb_lite",
+        seednum: int = -1, 
         **kwargs,
     ):
         self.bus = bus
@@ -45,6 +47,13 @@ class AHBLiteMaster:
             f"Copyright (c) {datetime.datetime.now().year} Anderson Ignacio da Silva"
         )
         self.log.info("https://github.com/aignacio/cocotbext-ahb")
+        self.backpressure = False
+        if -1 == seednum:
+            self.base_seed = randint(0,0xffffff)
+        else:
+            self.base_seed = seednum
+        seed(self.base_seed)
+        self.log.info(f"Seed: {self.base_seed}")
 
     def _init_bus(self) -> None:
         """Initialize the bus with default value."""
@@ -79,7 +88,7 @@ class AHBLiteMaster:
         for hsize in AHBSize:
             if (2**hsize.value) == value:
                 return hsize
-        raise ValueError(f"No hsize value found for {value} number of bytes")
+        raise ValueError(f"No hsize value found for {value} number of bytes {hsize.value}")
 
     @staticmethod
     def _check_size(size: int, data_bus_width: int) -> None:
@@ -93,9 +102,7 @@ class AHBLiteMaster:
         elif size <= 0 or (size & (size - 1)) != 0:
             raise ValueError(f"Error -> {size} - Size must" f"be a positive power of 2")
 
-    def _fmt_amba(
-        self, address: Sequence[int], size: Sequence[int], value: Sequence[int]
-    ) -> Sequence[int]:
+    def _fmt_amba(self, address: Sequence[int], size: Sequence[int], value: Sequence[int]) -> Sequence[int]:
         """Format the write data to follow AMBA by shifting / masking data."""
         new_val = []
         offset = (self.bus.data_width // 8) - 1
@@ -108,7 +115,7 @@ class AHBLiteMaster:
                     data = (val & 0xFFFF) << ((addr & offset) * 8)
                 elif sz == 1:
                     data = (val & 0xFF) << ((addr & offset) * 8)
-                new_val.append(data & (2**self.bus.data_width - 1))
+                new_val.append(data)
             else:
                 new_val.append(val)
         return new_val
@@ -173,6 +180,7 @@ class AHBLiteMaster:
         pip: bool = False,
         verbose: bool = False,
         sync: bool = False,
+#         delay: int = 0,
     ) -> Sequence[dict]:
         """Drives the AHB transaction into the bus."""
         response = []
@@ -222,6 +230,15 @@ class AHBLiteMaster:
                             )
             self.bus.hwdata.value = txn_data
             if self.bus.hready_in_exist:
+                delay = 0
+                if self.backpressure:
+                    if 0 == randint(0, 4):
+                        delay = randint(0, 2)
+                
+#                 print(self.backpressure, delay)
+                for i in range(delay):
+                    self.bus.hready_in.value = 0
+                    await RisingEdge(self.clk)
                 self.bus.hready_in.value = 1
 
             await RisingEdge(self.clk)
@@ -315,6 +332,9 @@ class AHBLiteMaster:
         if not isinstance(value, list):
             value = [value]
 
+        if format_amba is True:
+            value = self._fmt_amba(address, size, value)
+
         # if not isinstance(size, list):
         # size = [size]
 
@@ -330,9 +350,6 @@ class AHBLiteMaster:
                 f"Address length ({len(address)}) is"
                 f"different from size length ({len(size)})"
             )
-
-        if format_amba is True:
-            value = self._fmt_amba(address, size, value)
 
         # Need to copy data as we'll have to shift address/value
         t_address = copy.deepcopy(address)
@@ -353,6 +370,7 @@ class AHBLiteMaster:
         width = len(self.bus.htrans)
         t_trans = self._create_vector(t_trans, width, "address_ph", pip)
 
+#         print(address, t_address, t_value, t_size, t_mode, t_trans)
         return await self._send_txn(
             t_address, t_value, t_size, t_mode, t_trans, pip, verbose, sync
         )
@@ -419,7 +437,6 @@ class AHBLiteMaster:
         pip: Optional[bool] = True,
         verbose: Optional[bool] = False,
         sync: Optional[bool] = False,
-        format_amba: Optional[bool] = False,
     ) -> Sequence[dict]:
         """Back-to-Back operation"""
 
@@ -449,9 +466,6 @@ class AHBLiteMaster:
             value = [value]
         if not isinstance(mode, list):
             mode = [mode]
-
-        if format_amba is True:
-            value = self._fmt_amba(address, size, value)
 
         # Need to copy data as we'll have to shift address/size
         t_address = copy.deepcopy(address)
