@@ -12,7 +12,7 @@ import copy
 import struct
 import datetime
 
-from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp
+from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp, AHBBurst
 from .ahb_bus import AHBBus
 from .version import __version__
 
@@ -108,6 +108,8 @@ class AHBMonitor(Monitor):
                         int(first_txn["haddr"]),
                         AHBSize(first_txn["hsize"]),
                         AHBWrite(first_txn["hwrite"]),
+                        AHBBurst(first_txn["hburst"]),
+                        AHBTrans(first_txn["htrans"]),
                         AHBResp(first_txn["response"]),
                         int(first_txn["hwdata"]),
                         int(first_txn["hrdata"]),
@@ -136,6 +138,9 @@ class AHBMonitor(Monitor):
                 first_txn["htrans"] = copy.deepcopy(self.bus.htrans.value)
                 first_txn["hsize"] = copy.deepcopy(self.bus.hsize.value)
                 first_txn["hwrite"] = copy.deepcopy(self.bus.hwrite.value)
+                first_txn["hburst"] = AHBBurst.SINGLE
+                if self.bus.hburst_exist:
+                    first_txn["hburst"] = copy.deepcopy(self.bus.hburst.value)
             # We only enter in the if below if the last txn did not complete and the master issued a new txn
             elif (self._check_valid_txn() is True) and (first_st["phase"] == "data"):
                 second_st["phase"] = "addr"
@@ -147,6 +152,9 @@ class AHBMonitor(Monitor):
                 second_txn["htrans"] = copy.deepcopy(self.bus.htrans.value)
                 second_txn["hsize"] = copy.deepcopy(self.bus.hsize.value)
                 second_txn["hwrite"] = copy.deepcopy(self.bus.hwrite.value)
+                second_txn["hburst"] = AHBBurst.SINGLE
+                if self.bus.hburst_exist:
+                    second_txn["hburst"] = copy.deepcopy(self.bus.hburst.value)
 
             if first_st["phase"] == "addr":
                 self._check_signals(first_txn)
@@ -175,6 +183,9 @@ class AHBMonitor(Monitor):
 
         if self.bus.hready_in_exist:
             signals["hready_in"] = self.bus.hready_in
+
+        if self.bus.hburst_exist:
+            signals["hburst"] = self.bus.hburst
 
         for var, val in signals.items():
             if val.value.is_resolvable is False:
@@ -247,6 +258,8 @@ class AHBTxn:
         addr: int = 0x00,
         size: AHBSize = AHBSize.BYTE,
         mode: AHBWrite = AHBWrite.READ,
+        burst: AHBBurst = AHBBurst.SINGLE,
+        trans: AHBTrans = AHBTrans.NONSEQ,
         resp: AHBResp = AHBResp.OKAY,
         wdata: int = 0x00,
         rdata: int = 0x00,
@@ -254,6 +267,8 @@ class AHBTxn:
         self.addr = addr
         self.size = size
         self.mode = mode
+        self.burst = burst
+        self.trans = trans
         self.resp = resp
         self.wdata = wdata
         self.rdata = rdata
@@ -264,6 +279,8 @@ class AHBTxn:
             f"  Address: 0x{self.addr:08X}\n"
             f"  Size: {2**self.size} bytes (0x{self.size:03X})\n"
             f"  Mode: {'Write' if self.mode == 1 else 'Read'} (0x{self.mode:01X})\n"
+            f"  Burst: {self.burst.name}\n"
+            f"  Transfer: {self.trans.name}\n"
             f"  Response: {'OKAY' if self.resp == 0 else 'ERROR'} (0x{self.resp:02X})\n"
             f"  Write Data: 0x{self.wdata:08X}\n"
             f"  Read Data: 0x{self.rdata:08X}\n"
@@ -277,6 +294,8 @@ class AHBTxn:
                 self.addr == other.addr
                 and self.size == other.size
                 and self.mode == other.mode
+                and self.burst == other.burst
+                and self.trans == other.trans
                 and self.resp == other.resp
                 and self.wdata == other.wdata
                 and self.rdata == other.rdata
