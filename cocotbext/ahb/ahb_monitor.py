@@ -23,6 +23,16 @@ from cocotb_bus.monitors import Monitor
 from typing import Optional, Union, Generator, List, Any
 from .memory import Memory
 
+import re
+
+
+def resolve_x_int(x):
+    try:
+        return int(x)
+    except ValueError:
+        if re.search("[xz]", str(x), re.I):
+            y = re.sub("[xz]", "0", str(x), flags=re.I)
+        return int(y)
 
 class AHBMonitor(Monitor):
     def __init__(
@@ -109,8 +119,8 @@ class AHBMonitor(Monitor):
                         AHBSize(first_txn["hsize"]),
                         AHBWrite(first_txn["hwrite"]),
                         AHBResp(first_txn["response"]),
-                        int(first_txn["hwdata"]),
-                        int(first_txn["hrdata"]),
+                        resolve_x_int(first_txn["hwdata"]),
+                        resolve_x_int(first_txn["hrdata"]),
                     )
 
                     self._recv(txn)
