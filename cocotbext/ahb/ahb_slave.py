@@ -53,9 +53,9 @@ class AHBLiteSlave:
 
     def _init_bus(self) -> None:
         """Initialize the bus with default value."""
-        self.bus.hready.setimmediatevalue(1)
-        self.bus.hresp.setimmediatevalue(AHBResp.OKAY)
-        self.bus.hrdata.setimmediatevalue(0)
+        self.bus.hready.value = 1
+        self.bus.hresp.value = AHBResp.OKAY
+        self.bus.hrdata.value = 0
 
     def _get_def(self, width: int = 1) -> LogicArray:
         """Return a handle obj with the default value"""
@@ -77,11 +77,11 @@ class AHBLiteSlave:
             if self.rst.value.is_resolvable:
                 if self.rst_act_low:
                     if self.rst.value == 0:  # Active 0
-                        self.log.warn("Slave AHB reset issued")
+                        self.log.warning("Slave AHB reset issued")
                         self._init_bus()
                 else:
                     if self.rst.value == 1:  # Active 1
-                        self.log.warn("Slave AHB reset issued")
+                        self.log.warning("Slave AHB reset issued")
                         self._init_bus()
 
             # Wait for a txn
@@ -115,15 +115,15 @@ class AHBLiteSlave:
                 if wr_start and cur_hready and cur_hready_in:
                     wr_start = False
                     if txn_type == AHBWrite.WRITE:
-                        wr = self._wr(txn_addr, txn_size, self.bus.hwdata.value)
+                        wr = self._wr(txn_addr, txn_size, int(self.bus.hwdata.value))
                         self.bus.hrdata.value = wr
                         self.bus.hresp.value = AHBResp.OKAY
 
             # Check for new txn
             if cur_hready and self._check_inputs() and self._check_valid_txn():
-                txn_addr = self.bus.haddr.value
-                txn_size = AHBSize(self.bus.hsize.value)
-                txn_type = AHBWrite(self.bus.hwrite.value)
+                txn_addr = int(self.bus.haddr.value)
+                txn_size = AHBSize(int(self.bus.hsize.value))
+                txn_type = AHBWrite(int(self.bus.hwrite.value))
                 self._check_size(2**txn_size, self.bus.data_width)
 
                 if txn_type == AHBWrite.WRITE:
@@ -171,8 +171,18 @@ class AHBLiteSlave:
         elif size <= 0 or (size & (size - 1)) != 0:
             raise ValueError(f"Error -> {size} - Size must" f"be a positive power of 2")
 
+    @staticmethod
+    def _signal_ready(sig) -> bool:
+        if sig is None or not sig.value.is_resolvable:
+            return False
+        try:
+            int(sig.value)
+        except ValueError:
+            return False
+        return True
+
     def _check_inputs(self) -> bool:
-        """Check any of the master signals are resolvable (i.e not 'z')"""
+        """Check master address-phase signals are driven with 0/1 values."""
         signals = {
             "htrans": self.bus.htrans,
             "hwrite": self.bus.hwrite,
@@ -180,15 +190,17 @@ class AHBLiteSlave:
             "hsize": self.bus.hsize,
         }
 
-        for var, val in signals.items():
-            if val.value.is_resolvable is False:
-                # self.log.warn(f"{var} is not resolvable")
+        for val in signals.values():
+            if not self._signal_ready(val):
                 return False
         return True
 
     def _check_valid_txn(self) -> bool:
-        htrans_st = (AHBTrans(self.bus.htrans.value) != AHBTrans.IDLE) and (
-            AHBTrans(self.bus.htrans.value) != AHBTrans.BUSY
+        if not self._signal_ready(self.bus.htrans):
+            return False
+        htrans = int(self.bus.htrans.value)
+        htrans_st = (AHBTrans(htrans) != AHBTrans.IDLE) and (
+            AHBTrans(htrans) != AHBTrans.BUSY
         )
 
         if self.bus.hsel_exist:
@@ -298,7 +310,7 @@ class AHBLiteSlaveRAM(AHBLiteSlave):
         data = (data_mask << (byte_offset * 8)) & mem_data
         return data
 
-    def _wr(self, addr: int, size: AHBSize, value: LogicArray) -> int:
+    def _wr(self, addr: int, size: AHBSize, value) -> int:
         wr_bytes_num = 1 << size
         wr_bits_num = wr_bytes_num * 8
 
@@ -322,7 +334,8 @@ class AHBLiteSlaveRAM(AHBLiteSlave):
         # Get mask by hsize
         data_mask = (1 << wr_bits_num) - 1
 
-        data = (value.integer >> (byte_offset * 8)) & data_mask
+        value_int = value.integer if hasattr(value, "integer") else int(value)
+        data = (value_int >> (byte_offset * 8)) & data_mask
 
         # Get the (d)word data from memory
         mem_data = self.memory.read(addr_aligned, bus_bytes_width)

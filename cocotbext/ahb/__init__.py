@@ -16,5 +16,5 @@
 from .ahb_master import AHBLiteMaster, AHBMaster
 from .ahb_slave import AHBLiteSlave, AHBSlave, AHBLiteSlaveRAM
 from .ahb_bus import AHBBus
-from .ahb_types import AHBResp, AHBSize, AHBBurst, AHBTrans, AHBWrite
+from .ahb_types import AHBResp, AHBSize, AHBBurst, AHBTrans, AHBWrite, AHBPipelineMode
 from .ahb_monitor import AHBMonitor, AHBTxn

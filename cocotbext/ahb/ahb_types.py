@@ -45,3 +45,11 @@ class AHBTrans(enum.IntEnum):
 class AHBWrite(enum.IntEnum):
     READ = 0b0
     WRITE = 0b1
+
+
+class AHBPipelineMode(enum.Enum):
+    """AHB master address/data phase scheduling."""
+
+    PACED = "paced"  # non-pipelined (legacy pip=False)
+    PIPELINED = "pipelined"  # addr/data overlap (legacy pip=True)
+    CPU_LIKE = "cpu_like"  # addr+data together per beat, wait hready between beats

@@ -10,7 +10,14 @@ import cocotb
 import copy
 import datetime
 
-from .ahb_types import AHBTrans, AHBWrite, AHBSize, AHBResp, AHBBurst
+from .ahb_types import (
+    AHBTrans,
+    AHBWrite,
+    AHBSize,
+    AHBResp,
+    AHBBurst,
+    AHBPipelineMode,
+)
 from .ahb_bus import AHBBus
 from .version import __version__
 
@@ -46,25 +53,35 @@ class AHBLiteMaster:
         )
         self.log.info("https://github.com/aignacio/cocotbext-ahb")
 
+    def _master_drive_signals(self) -> List[str]:
+        """Signals driven by the master (required + present optional)."""
+        skip = {"hready", "hresp", "hrdata", "hexokay"}
+        names = list(self.bus._signals)
+        if hasattr(self.bus, "_optional_signals"):
+            names.extend(self.bus._optional_signals)
+        return [s for s in names if s not in skip]
+
     def _init_bus(self) -> None:
         """Initialize the bus with default value."""
-        for signal in self.bus._signals:
-            if signal not in ["hready", "hresp", "hrdata"]:
-                sig = getattr(self.bus, signal)
-                try:
-                    sig.setimmediatevalue(self._get_def(len(sig)))
-                except AttributeError:
-                    pass
+        for signal in self._master_drive_signals():
+            sig = getattr(self.bus, signal, None)
+            if sig is None:
+                continue
+            try:
+                sig.setimmediatevalue(self._get_def(len(sig)))
+            except AttributeError:
+                pass
 
     def _reset_bus(self) -> None:
         """Initialize the bus with default value."""
-        for signal in self.bus._signals:
-            if signal not in ["hready", "hresp", "hrdata"]:
-                sig = getattr(self.bus, signal)
-                try:
-                    sig.value = self._get_def(len(sig))
-                except AttributeError:
-                    pass
+        for signal in self._master_drive_signals():
+            sig = getattr(self.bus, signal, None)
+            if sig is None:
+                continue
+            try:
+                sig.value = self._get_def(len(sig))
+            except AttributeError:
+                pass
 
     def _get_def(self, width: int = 1) -> LogicArray:
         """Return a handle obj with the default value"""
@@ -80,6 +97,17 @@ class AHBLiteMaster:
             if (2**hsize.value) == value:
                 return hsize
         raise ValueError(f"No hsize value found for {value} number of bytes")
+
+    @staticmethod
+    def _resolve_pipeline_mode(
+        pip: Optional[bool],
+        mode: Optional[AHBPipelineMode],
+    ) -> AHBPipelineMode:
+        if mode is not None:
+            return mode
+        if pip is True:
+            return AHBPipelineMode.PIPELINED
+        return AHBPipelineMode.PACED
 
     @staticmethod
     def _check_size(size: int, data_bus_width: int) -> None:
@@ -113,7 +141,14 @@ class AHBLiteMaster:
                 new_val.append(val)
         return new_val
 
-    def _addr_phase(self, addr: int, size: int, mode: AHBWrite, trans: AHBTrans):
+    def _addr_phase(
+        self,
+        addr: int,
+        size: int,
+        mode: AHBWrite,
+        trans: AHBTrans,
+        exclusive: bool = False,
+    ):
         """Drive the AHB signals of the address phase."""
         self.bus.haddr.value = addr
         self.bus.htrans.value = trans
@@ -127,6 +162,16 @@ class AHBLiteMaster:
             self.bus.hready_in.value = 1
         if self.bus.hburst_exist:
             self.bus.hburst.value = AHBBurst.SINGLE
+        if self.bus.hmastlock_exist:
+            self.bus.hmastlock.value = 0
+        if self.bus.hprot_exist:
+            self.bus.hprot.value = 0
+        if self.bus.hnonsec_exist:
+            self.bus.hnonsec.value = 1
+        if self.bus.hmaster_exist:
+            self.bus.hmaster.value = 0
+        if self.bus.hexcl_exist:
+            self.bus.hexcl.value = 1 if exclusive else 0
 
     def _create_vector(
         self, vec: Sequence[int], width: int, phase: str, pip: Optional[bool] = False
@@ -170,6 +215,7 @@ class AHBLiteMaster:
         size: Sequence[int],
         mode: Sequence[AHBWrite],
         trans: Sequence[AHBTrans],
+        exclusive: Sequence[bool] = (),
         pip: bool = False,
         verbose: bool = False,
         sync: bool = False,
@@ -196,19 +242,27 @@ class AHBLiteMaster:
             # If pip is False, just create a simple list of sequential numbers
             id_ahb = list(range(len(address)))
 
+        if not exclusive:
+            exclusive = [False for _ in range(len(address))]
+        elif len(exclusive) != len(address):
+            raise Exception(
+                f"Exclusive length ({len(exclusive)}) differs from address length ({len(address)})"
+            )
+
         while index < len(address):
-            txn_addr, txn_data, txn_size, txn_mode, txn_trans, txn_id = (
+            txn_addr, txn_data, txn_size, txn_mode, txn_trans, txn_id, txn_excl = (
                 address[index],
                 value[index],
                 size[index],
                 mode[index],
                 trans[index],
                 id_ahb[index],
+                exclusive[index],
             )
             if index == len(address) - 1:
                 self._reset_bus()
             else:
-                self._addr_phase(txn_addr, txn_size, txn_mode, txn_trans)
+                self._addr_phase(txn_addr, txn_size, txn_mode, txn_trans, txn_excl)
                 if txn_id != "BUBBLE":
                     if not isinstance(txn_addr, LogicArray):
                         op = "write" if txn_mode == 1 else "read"
@@ -274,15 +328,120 @@ class AHBLiteMaster:
                 # always one more
                 if not pip:
                     first_txn = True
-                response += [
-                    {
-                        "resp": AHBResp(int(self.bus.hresp.value)),
-                        "data": hex(self.bus.hrdata.value),
-                    }
-                ]
+                resp_entry = {
+                    "resp": AHBResp(int(self.bus.hresp.value)),
+                    "data": hex(self.bus.hrdata.value),
+                }
+                if self.bus.hexokay_exist:
+                    resp_entry["hexokay"] = int(self.bus.hexokay.value)
+                response += [resp_entry]
             if restart:  # As we withdrawn the last txn, let's restart
                 first_txn = True
                 restart = False
+
+        self._reset_bus()
+        return response
+
+    async def _wait_slave_signals(self, timeout_counter: int = 0) -> int:
+        """Wait until slave response signals are resolvable."""
+        while any(
+            [
+                not self.bus.hready.value.is_resolvable,
+                not self.bus.hresp.value.is_resolvable,
+                not self.bus.hrdata.value.is_resolvable,
+            ]
+        ):
+            timeout_counter += 1
+            if timeout_counter == self.timeout:
+                raise Exception(
+                    f"Timeout value of {timeout_counter}"
+                    f" clock cycles has been reached because AHB.SLAVE"
+                    f"signals are not resolvable!\n"
+                    f"hready: {self.bus.hready.value.is_resolvable}\n"
+                    f"hrdata: {self.bus.hrdata.value.is_resolvable}\n"
+                    f"hresp: {self.bus.hresp.value.is_resolvable}\n"
+                )
+            await RisingEdge(self.clk)
+        return timeout_counter
+
+    async def _wait_hready(self, timeout_counter: int = 0) -> int:
+        """Wait until the slave asserts HREADY."""
+        while self.bus.hready.value != 1:
+            timeout_counter += 1
+            if timeout_counter == self.timeout:
+                raise Exception(
+                    f"Timeout value of {timeout_counter}"
+                    f" clock cycles has been reached!"
+                )
+            await RisingEdge(self.clk)
+        return timeout_counter
+
+    def _response_entry(self) -> dict:
+        resp_entry = {
+            "resp": AHBResp(int(self.bus.hresp.value)),
+            "data": hex(self.bus.hrdata.value),
+        }
+        if self.bus.hexokay_exist and self.bus.hexokay.value.is_resolvable:
+            resp_entry["hexokay"] = int(self.bus.hexokay.value)
+        return resp_entry
+
+    async def _send_txn_cpu_like(
+        self,
+        address: Sequence[int],
+        value: Sequence[int],
+        size: Sequence[int],
+        mode: Sequence[AHBWrite],
+        trans: Sequence[AHBTrans],
+        exclusive: Sequence[bool] = (),
+        verbose: bool = False,
+        sync: bool = False,
+    ) -> Sequence[dict]:
+        """Drive one beat at a time: addr (+ write data) together, wait for HREADY."""
+        response = []
+        n = len(address)
+
+        if sync:
+            await RisingEdge(self.clk)
+
+        if not exclusive:
+            exclusive = [False for _ in range(n)]
+        elif len(exclusive) != n:
+            raise Exception(
+                f"Exclusive length ({len(exclusive)}) differs from address length ({n})"
+            )
+
+        for index in range(n):
+            txn_addr = address[index]
+            txn_data = value[index]
+            txn_size = size[index]
+            txn_mode = mode[index]
+            txn_trans = trans[index]
+            txn_excl = exclusive[index]
+
+            if isinstance(txn_addr, LogicArray):
+                raise ValueError("CPU_LIKE mode does not support LogicArray addresses")
+
+            self._addr_phase(txn_addr, txn_size, txn_mode, txn_trans, txn_excl)
+            if txn_mode == AHBWrite.WRITE:
+                self.bus.hwdata.value = txn_data
+            if self.bus.hready_in_exist:
+                self.bus.hready_in.value = 1
+
+            if verbose:
+                op = "write" if txn_mode == AHBWrite.WRITE else "read"
+                self.log.info(
+                    f"AHB {op} txn (CPU_LIKE):\n"
+                    f"\tID = {index}\n"
+                    f"\tADDR = 0x{txn_addr:x}\n"
+                    f"\tDATA = 0x{txn_data:x}\n"
+                    f"\tSIZE = {txn_size} byte[s]"
+                )
+
+            await RisingEdge(self.clk)
+
+            timeout_counter = await self._wait_slave_signals()
+            timeout_counter = await self._wait_hready(timeout_counter)
+            response.append(self._response_entry())
 
         self._reset_bus()
         return response
@@ -292,7 +451,9 @@ class AHBLiteMaster:
         address: Union[int, Sequence[int]],
         value: Union[int, Sequence[int]],
         size: Optional[Union[int, Sequence[int]]] = None,
+        exclusive: Optional[Union[bool, Sequence[bool]]] = False,
         pip: Optional[bool] = False,
+        mode: Optional[AHBPipelineMode] = None,
         verbose: Optional[bool] = False,
         sync: Optional[bool] = False,
         format_amba: Optional[bool] = False,
@@ -310,15 +471,9 @@ class AHBLiteMaster:
             for sz in size:
                 AHBLiteMaster._check_size(sz, len(self.bus.hwdata) // 8)
 
-        # Convert all inputs into lists, if not already
-
         if not isinstance(value, list):
             value = [value]
 
-        # if not isinstance(size, list):
-        # size = [size]
-
-        # First check if the input sizes are correct
         if len(address) != len(value):
             raise Exception(
                 f"Address length ({len(address)}) is"
@@ -334,7 +489,28 @@ class AHBLiteMaster:
         if format_amba is True:
             value = self._fmt_amba(address, size, value)
 
-        # Need to copy data as we'll have to shift address/value
+        pipeline_mode = self._resolve_pipeline_mode(pip, mode)
+        if not isinstance(exclusive, list):
+            t_exclusive = [exclusive for _ in range(len(address))]
+        else:
+            t_exclusive = exclusive
+
+        if pipeline_mode == AHBPipelineMode.CPU_LIKE:
+            t_trans = [AHBTrans.NONSEQ for _ in range(len(address))]
+            t_mode = [AHBWrite.WRITE for _ in range(len(address))]
+            return await self._send_txn_cpu_like(
+                address,
+                value,
+                size,
+                t_mode,
+                t_trans,
+                t_exclusive,
+                verbose,
+                sync,
+            )
+
+        pip = pipeline_mode == AHBPipelineMode.PIPELINED
+
         t_address = copy.deepcopy(address)
         t_value = copy.deepcopy(value)
         t_size = copy.deepcopy(size)
@@ -345,23 +521,34 @@ class AHBLiteMaster:
         t_value = self._create_vector(t_value, width, "data_ph", pip)
         width = len(self.bus.hsize)
         t_size = self._create_vector(t_size, width, "address_ph", pip)
-        # Default signaling
         t_mode = [AHBWrite.WRITE for _ in range(len(t_address))]
         width = len(self.bus.hwrite)
         t_mode = self._create_vector(t_mode, width, "address_ph", pip)
         t_trans = [AHBTrans.NONSEQ for _ in range(len(t_address))]
         width = len(self.bus.htrans)
         t_trans = self._create_vector(t_trans, width, "address_ph", pip)
+        width = 1
+        t_exclusive = self._create_vector(t_exclusive, width, "address_ph", pip)
 
         return await self._send_txn(
-            t_address, t_value, t_size, t_mode, t_trans, pip, verbose, sync
+            t_address,
+            t_value,
+            t_size,
+            t_mode,
+            t_trans,
+            t_exclusive,
+            pip,
+            verbose,
+            sync,
         )
 
     async def read(
         self,
         address: Union[int, Sequence[int]],
         size: Optional[Union[int, Sequence[int]]] = None,
+        exclusive: Optional[Union[bool, Sequence[bool]]] = False,
         pip: Optional[bool] = False,
+        mode: Optional[AHBPipelineMode] = None,
         verbose: Optional[bool] = False,
         sync: Optional[bool] = False,
     ) -> Sequence[dict]:
@@ -373,21 +560,41 @@ class AHBLiteMaster:
         if size is None:
             size = [self.bus._data_width // 8 for _ in range(len(address))]
         else:
-            # Convert all inputs into lists, if not already
             if not isinstance(size, list):
                 size = [size]
 
             for sz in size:
                 AHBLiteMaster._check_size(sz, len(self.bus.hwdata) // 8)
 
-        # First check if the input sizes are correct
         if len(address) != len(size):
             raise Exception(
                 f"Address length ({len(address)}) is"
                 f"different from size length ({len(size)})"
             )
 
-        # Need to copy data as we'll have to shift address/size
+        pipeline_mode = self._resolve_pipeline_mode(pip, mode)
+        if not isinstance(exclusive, list):
+            t_exclusive = [exclusive for _ in range(len(address))]
+        else:
+            t_exclusive = exclusive
+
+        if pipeline_mode == AHBPipelineMode.CPU_LIKE:
+            t_trans = [AHBTrans.NONSEQ for _ in range(len(address))]
+            t_mode = [AHBWrite.READ for _ in range(len(address))]
+            t_value = [0 for _ in range(len(address))]
+            return await self._send_txn_cpu_like(
+                address,
+                t_value,
+                size,
+                t_mode,
+                t_trans,
+                t_exclusive,
+                verbose,
+                sync,
+            )
+
+        pip = pipeline_mode == AHBPipelineMode.PIPELINED
+
         t_address = copy.deepcopy(address)
         t_value = [0x00 for i in range(len(address))]
         t_size = copy.deepcopy(size)
@@ -398,16 +605,25 @@ class AHBLiteMaster:
         t_value = self._create_vector(t_value, width, "data_ph", pip)
         width = len(self.bus.hsize)
         t_size = self._create_vector(t_size, width, "address_ph", pip)
-        # Default signaling
         t_mode = [AHBWrite.READ for _ in range(len(t_address))]
         width = len(self.bus.hwrite)
         t_mode = self._create_vector(t_mode, width, "address_ph", pip)
         t_trans = [AHBTrans.NONSEQ for _ in range(len(t_address))]
         width = len(self.bus.htrans)
         t_trans = self._create_vector(t_trans, width, "address_ph", pip)
+        width = 1
+        t_exclusive = self._create_vector(t_exclusive, width, "address_ph", pip)
 
         return await self._send_txn(
-            t_address, t_value, t_size, t_mode, t_trans, pip, verbose, sync
+            t_address,
+            t_value,
+            t_size,
+            t_mode,
+            t_trans,
+            t_exclusive,
+            pip,
+            verbose,
+            sync,
         )
 
     async def custom(
@@ -416,12 +632,23 @@ class AHBLiteMaster:
         value: Union[int, Sequence[int]],
         mode: Union[int, Sequence[int]],
         size: Optional[Union[int, Sequence[int]]] = None,
+        exclusive: Optional[Union[bool, Sequence[bool]]] = False,
         pip: Optional[bool] = True,
+        pipeline_mode: Optional[AHBPipelineMode] = None,
         verbose: Optional[bool] = False,
         sync: Optional[bool] = False,
         format_amba: Optional[bool] = False,
     ) -> Sequence[dict]:
         """Back-to-Back operation"""
+
+        if not isinstance(address, list):
+            address = [address]
+        if not isinstance(size, list):
+            size = [size] if size is not None else None
+        if not isinstance(value, list):
+            value = [value]
+        if not isinstance(mode, list):
+            mode = [mode]
 
         if len(address) != len(value):
             raise Exception(
@@ -440,24 +667,35 @@ class AHBLiteMaster:
             for sz in size:
                 AHBLiteMaster._check_size(sz, len(self.bus.hwdata) // 8)
 
-        # Convert all inputs into lists, if not already
-        if not isinstance(address, list):
-            address = [address]
-        if not isinstance(size, list):
-            size = [size]
-        if not isinstance(value, list):
-            value = [value]
-        if not isinstance(mode, list):
-            mode = [mode]
-
         if format_amba is True:
             value = self._fmt_amba(address, size, value)
 
-        # Need to copy data as we'll have to shift address/size
+        resolved_mode = self._resolve_pipeline_mode(pip, pipeline_mode)
+        if not isinstance(exclusive, list):
+            t_exclusive = [exclusive for _ in range(len(address))]
+        else:
+            t_exclusive = exclusive
+
+        t_mode = [AHBWrite(m) for m in mode]
+
+        if resolved_mode == AHBPipelineMode.CPU_LIKE:
+            t_trans = [AHBTrans.NONSEQ for _ in range(len(address))]
+            return await self._send_txn_cpu_like(
+                address,
+                value,
+                size,
+                t_mode,
+                t_trans,
+                t_exclusive,
+                verbose,
+                sync,
+            )
+
+        pip = resolved_mode == AHBPipelineMode.PIPELINED
+
         t_address = copy.deepcopy(address)
         t_value = copy.deepcopy(value)
         t_size = copy.deepcopy(size)
-        t_mode = copy.deepcopy(mode)
 
         width = len(self.bus.haddr)
         t_address = self._create_vector(t_address, width, "address_ph", pip)
@@ -467,14 +705,43 @@ class AHBLiteMaster:
         t_size = self._create_vector(t_size, width, "address_ph", pip)
         width = len(self.bus.hwrite)
         t_mode = self._create_vector(t_mode, width, "address_ph", pip)
-        width = len(self.bus.htrans)
-        t_trans = [AHBTrans.NONSEQ for _ in range(len(t_address))]
+        t_trans = [AHBTrans.SEQ for _ in range(len(t_address))]
+        t_trans[0] = AHBTrans.NONSEQ
         width = len(self.bus.htrans)
         t_trans = self._create_vector(t_trans, width, "address_ph", pip)
+        width = 1
+        t_exclusive = self._create_vector(t_exclusive, width, "address_ph", pip)
 
         return await self._send_txn(
-            t_address, t_value, t_size, t_mode, t_trans, pip, verbose, sync
+            t_address,
+            t_value,
+            t_size,
+            t_mode,
+            t_trans,
+            t_exclusive,
+            pip,
+            verbose,
+            sync,
         )
+
+    async def read_excl(
+        self,
+        address: Union[int, Sequence[int]],
+        size: Optional[Union[int, Sequence[int]]] = None,
+        **kwargs,
+    ) -> Sequence[dict]:
+        """Exclusive read (HEXCL asserted in address phase)."""
+        return await self.read(address, size=size, exclusive=True, **kwargs)
+
+    async def write_excl(
+        self,
+        address: Union[int, Sequence[int]],
+        value: Union[int, Sequence[int]],
+        size: Optional[Union[int, Sequence[int]]] = None,
+        **kwargs,
+    ) -> Sequence[dict]:
+        """Exclusive write (HEXCL asserted in address phase)."""
+        return await self.write(address, value, size=size, exclusive=True, **kwargs)
 
 
 class AHBMaster(AHBLiteMaster):

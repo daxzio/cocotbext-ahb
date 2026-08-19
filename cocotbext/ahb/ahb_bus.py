@@ -68,17 +68,44 @@ class AHBBus(Bus):
     def addr_width(self):
         return self._addr_width
 
+    def _signal_exists(self, name: str) -> bool:
+        return hasattr(self, name)
+
     @property
     def hsel_exist(self):
-        return True if "hsel" in self._signals else False
+        return self._signal_exists("hsel")
 
     @property
     def hready_in_exist(self):
-        return True if "hready_in" in self._signals else False
+        return self._signal_exists("hready_in")
 
     @property
     def hburst_exist(self):
-        return True if "hburst" in self._signals else False
+        return self._signal_exists("hburst")
+
+    @property
+    def hmastlock_exist(self):
+        return self._signal_exists("hmastlock")
+
+    @property
+    def hprot_exist(self):
+        return self._signal_exists("hprot")
+
+    @property
+    def hnonsec_exist(self):
+        return self._signal_exists("hnonsec")
+
+    @property
+    def hexcl_exist(self):
+        return self._signal_exists("hexcl")
+
+    @property
+    def hmaster_exist(self):
+        return self._signal_exists("hmaster")
+
+    @property
+    def hexokay_exist(self):
+        return self._signal_exists("hexokay")
 
     @classmethod
     def from_entity(cls, entity, **kwargs):
